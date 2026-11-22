@@ -4,27 +4,27 @@
 
 **Tokens-per-second tracker for [pi](https://github.com/earendil-works/pi-coding-agent)**
 
-_Generation speed, TTFT, stall detection, and cost — after every agent turn._
+_Model request throughput, TTFT, delivery gaps, and cost after each Pi turn._
 
 [![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 </div>
 
-## Pi 1.0 compatibility (1.3.15)
+## Pi compatibility
 
-Development SDKs are pinned to **1.0.0**; host-provided dependencies remain wildcard peers. Run `bun run test:pi` for offline real-host registrations, prompt/tool loadouts, nested calls, reload and shutdown. Set `PI1_HOST_PACKAGE` to an installed Pi package directory and `PI1_HOST_ENTRY=bundle` to check its bundled runtime.
+Request TPS uses `AssistantMessage.durationMs`, which Pi 1.6.0 records on completed responses from its built-in streams. The banner displays `TPS —` when the runtime or provider supplies no usable duration.
 
 ---
 
-_Originally from [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/.pi/extensions/tps.ts). Packaged as an installable pi extension._
+_Fork of [monotykamary/pi-tps](https://github.com/monotykamary/pi-tps), originally from [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/.pi/extensions/tps.ts)._
 
 ---
 
 ## Quick start
 
 ```bash
-pi install npm:@monotykamary/pi-tps
+pi install npm:@firespoon/pi-tps
 ```
 
 ## What's included
@@ -36,11 +36,10 @@ pi install npm:@monotykamary/pi-tps
 
 ### Features
 
-- **Accurate TPS**: Uses `performance.now()` sub-millisecond timing; excludes TTFT, tool-execution gaps, and network latency from generation speed
-- **Stall detection**: Detects inference pauses (GPU queuing, request queuing) and subtracts them from generation TPS — no inflated rates
-- **Burst discrimination**: Distinguishes genuine streaming from buffer-flush dispatch; shows `—` when the rate is structurally unidentifiable
-- **Multi-message turns**: Aggregates tokens and timing across tool-call chains within one turn
-- **Notification banner**: Shows a transient popup with TPS, TTFT, total time, tokens, and stalls
+- **Request TPS** divides provider-reported output tokens by Pi's native request duration.
+- **Stall diagnostics** report gaps in stream delivery, including gaps of at least 500 ms.
+- **Multi-message turns** sum output tokens and their request durations.
+- **Notification banner** shows TPS, TTFT, request time, total turn time, tokens, and stalls.
 - **Completion notification**: After the assistant fully settles, the TPS notification includes `done` and the local completion time. Aborted runs do not show it.
 - **Persisted notifications**: Restored on session resume and `/tree` navigation (structured + legacy backward compatible)
 - **Export command**: Dump telemetry as JSONL with automatic tree re-chaining for web inspectors
@@ -49,13 +48,15 @@ pi install npm:@monotykamary/pi-tps
 ## Install
 
 ```bash
-pi install npm:@monotykamary/pi-tps
+pi install npm:@firespoon/pi-tps
 ```
+
+If you already have the upstream extension installed, remove it with `pi remove npm:@monotykamary/pi-tps` before installing the fork.
 
 Or install from GitHub:
 
 ```bash
-pi install https://github.com/monotykamary/pi-tps
+pi install https://github.com/FireSpoonYZ/pi-tps
 ```
 
 The published npm package is intentionally slim: only `extensions/pi-tps/index.ts`, `README.md`, and `LICENSE`. It has **no runtime `dependencies`** and does **not** ship `npm-shrinkwrap.json` / lockfiles, so installs do not pull the multi-hundred-MB developer toolchain into `~/.pi/agent/npm`.
@@ -76,20 +77,21 @@ Then `/reload` in pi.
 ## Output format
 
 ```
-TPS 42.5 tok/s · TTFT 1.2s · 29.7s · in 567 · out 1.2K · stall 4.3s×1 · $3.60/M
+TPS 42.5 tok/s · TTFT 1.2s · req 28.2s · 29.7s · in 567 · out 1.2K · stall 4.3s×1 · $3.60/M
 ```
 
 | Field   | Description                                                                              |
 | ------- | ---------------------------------------------------------------------------------------- |
-| `TPS`   | Tokens per second (generation speed, excludes TTFT & stalls)                             |
-| `TTFT`  | Time to first token (seconds, 1 decimal)                                                 |
-| `s`     | Total wall-clock time from request to completion                                         |
+| `TPS`   | Output tokens per second over the model request duration |
+| `TTFT`  | Time from turn start to the first assistant update |
+| `req`   | Native model request duration, when available |
+| `s`     | Total wall-clock time from turn start to turn end |
 | `in`    | Input tokens (human-readable: K/M/B)                                                     |
 | `out`   | Output tokens (human-readable: K/M/B)                                                    |
 | `stall` | Accumulated stall time × stall count (shown only when stalls exist)                      |
 | `$/M`   | Blended $/million-tokens rate for this turn (shown only when a cost source is available) |
 
-When TPS can't be determined (burst delivery, too few chunks), the field shows `—`:
+When Pi supplies no positive request duration, the banner displays `TPS —`.
 
 ```
 TPS — · TTFT 0.8s · 1.3s · in 291 · out 46 · $2.59/M
@@ -121,54 +123,27 @@ Duration formatting:
 
 ## How it works
 
-The extension hooks into pi's lifecycle events. The critical detail: `message_start` fires at stream creation (before any tokens), so **TTFT is measured at the first `message_update`**, which carries the first real token content.
+The extension reads the final assistant message's `usage.output` and `durationMs` and reports the result at `turn_end`.
 
-### Event sequence
+```text
+TPS = output tokens / (request duration in milliseconds / 1000)
+```
 
-```
-turn_start         →  request sent to LLM, timer starts
-message_start      →  stream created, stall-tracking reset for this message
-message_update (1) →  first token arrives → TTFT captured
-message_update (N) →  streaming tokens arrive → inter-update span & stall detection
-message_end        →  message complete, generation time accumulated
-turn_end           →  telemetry computed and displayed
-```
+The token count includes reasoning reported in `usage.output`. Pi measures `durationMs` from the creation of the provider's response stream until completion. This includes first-response wait, networking, and delivery gaps. Context hooks such as automatic Hindsight recall run before that stream starts, and local tools execute after the model response. For turns with multiple output-bearing assistant messages, the extension sums their tokens and request durations.
 
 ### Timing breakdown
 
-| Phase           | Measured by                                                                                  |
-| --------------- | -------------------------------------------------------------------------------------------- |
-| **TTFT**        | `turn_start` → first `message_update`                                                        |
-| **Generation**  | per-message wall clock (`message_start` → `message_end`), summed across messages in the turn |
-| **Stream span** | first `message_update` (post-TTFT) → last `message_update` — the pure streaming window       |
-| **Total**       | `turn_start` → last `message_end` in the turn                                                |
-
-This approach excludes:
-
-- **Network latency** (included in TTFT)
-- **Tool-execution gaps** between messages (stall clock resets on each `message_start`)
-- **Server queue time** (included in TTFT)
+| Phase | Measured by |
+| --- | --- |
+| **Request** | Pi's native `durationMs`, summed for output-bearing messages |
+| **TTFT** | `turn_start` to the first assistant `message_update`. The first update can be a content-block marker. |
+| **Message events** | `message_start` to `message_end`, summed across messages |
+| **Stream span** | Second through last assistant `message_update` |
+| **Total** | `turn_start` to `turn_end`, including any tool execution in the turn |
 
 ### Stall detection
 
-Every `message_update` (after TTFT) measures the gap since the last update. Gaps ≥ 500ms are classified as inference stalls:
-
-- The full gap is accumulated as `stallMs`
-- Consecutive stalled updates count as one stall event
-- Stalls are subtracted from the streaming window when computing generation TPS
-- The stall clock resets at each `message_start`, so tool-execution gaps between messages are never counted as stalls
-
-When a stall occurs **before** the first stream update (common in request-queuing scenarios), the TPS algorithm detects the artifact and falls back to a conservative estimate rather than producing an inflated rate.
-
-### TPS algorithm (three-branch gate)
-
-The extension uses a defense-in-depth strategy to produce reliable TPS:
-
-1. **Primary** — Requires ≥5 streaming updates with ≥1ms average inter-chunk gap and stall time < active generation time. Subtracts stalls from the streaming window for pure generation speed.
-
-2. **Fallback** — When primary conditions fail but ≥2 updates exist and total generation time ≥50ms. Uses the full generation window (includes TTFT, so it underestimates — safe by design). Applies partial stall reduction when stalls dominate.
-
-3. **Null** — Returns `null` (displayed as `—`) when the timing is structurally unidentifiable: burst delivery (all tokens arrive in the same tick), too few chunks, or generation time too short for a reliable rate.
+A gap of at least 500 ms between assistant updates contributes its full duration to `stallMs`. Consecutive long gaps count as one stall. The extension resets the gap timer at each `message_start`. The request duration used for TPS includes these gaps.
 
 ---
 
@@ -212,7 +187,8 @@ The event payload:
 
 | Field                 | Type             | Description                                                                                                                                                           |
 | --------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tps`                 | `number \| null` | Tokens per second, or null when unidentifiable                                                                                                                        |
+| `tps` | `number \| null` | Output tokens per second over the native request duration |
+| `isPrimaryBranch` | `boolean` | Compatibility field. New entries set it to true when TPS uses native request timing. |
 | `model.provider`      | `string`         | Provider name (e.g. `openai`)                                                                                                                                         |
 | `model.modelId`       | `string`         | Model identifier (e.g. `gpt-4`)                                                                                                                                       |
 | `tokens.input`        | `number`         | Input tokens (summed across all assistant messages)                                                                                                                   |
@@ -220,11 +196,12 @@ The event payload:
 | `tokens.cacheRead`    | `number`         | Cache-read tokens (provider-dependent)                                                                                                                                |
 | `tokens.cacheWrite`   | `number`         | Cache-write tokens (provider-dependent)                                                                                                                               |
 | `tokens.total`        | `number`         | Total tokens (input + output + cache)                                                                                                                                 |
-| `timing.ttftMs`       | `number \| null` | Time to first token in milliseconds                                                                                                                                   |
-| `timing.totalMs`      | `number`         | Total wall-clock time from request to completion                                                                                                                      |
-| `timing.generationMs` | `number`         | Streaming wall clock (message_start → message_end)                                                                                                                    |
-| `timing.streamMs`     | `number \| null` | Inter-update span: first → last streaming update                                                                                                                      |
-| `timing.stallMs`      | `number`         | Accumulated inference stall time in ms                                                                                                                                |
+| `timing.ttftMs` | `number \| null` | Milliseconds from turn start to the first assistant update |
+| `timing.totalMs` | `number` | Milliseconds from turn start to turn end |
+| `timing.generationMs` | `number` | Sum of assistant message event spans in milliseconds |
+| `timing.requestMs` | `number \| null` | Sum of native request durations. Earlier telemetry entries may omit the field. |
+| `timing.streamMs` | `number \| null` | Milliseconds from the second to the last assistant update |
+| `timing.stallMs` | `number` | Total time in long gaps between updates, in milliseconds |
 | `timing.stallCount`   | `number`         | Number of discrete stall events                                                                                                                                       |
 | `timing.messageCount` | `number`         | Assistant messages in this turn                                                                                                                                       |
 | `cost.input`          | `number \| null` | Input token cost                                                                                                                                                      |

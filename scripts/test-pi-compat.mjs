@@ -178,7 +178,7 @@ export default function () {
     'pi-reason-harness': 'reason',
     'pi-recurse': 'recurse-status',
     '@monotykamary/pi-supervisor': 'supervise',
-    '@monotykamary/pi-tps': 'tps-export',
+    '@firespoon/pi-tps': 'tps-export',
     'pi-tps-web': 'tps-web',
     'pi-var': 'var',
   }[manifest.name];
@@ -244,7 +244,7 @@ export default function () {
       (message) => message.role === 'toolResult' && message.toolCallId === 'outer'
     )?.nestedCalls
   );
-  if (manifest.name === '@monotykamary/pi-tps') {
+  if (manifest.name === '@firespoon/pi-tps') {
     const telemetry = session.sessionManager
       .getBranch()
       .filter((entry) => entry.type === 'custom' && entry.customType === 'tps');

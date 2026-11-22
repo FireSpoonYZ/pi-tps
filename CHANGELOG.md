@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 (2026-11-22)
+
+- Measure TPS using Pi's native model request duration and the provider's output token count.
+- Display request duration alongside total turn time and stall diagnostics.
+- Publish the fork as `@firespoon/pi-tps`.
+
 ## 1.3.19
 
 - Show the local completion time in the TPS notification after the assistant fully settles.

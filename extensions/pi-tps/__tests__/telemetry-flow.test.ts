@@ -90,7 +90,10 @@ describe('pi-tps extension — telemetry flow', () => {
       assistantMessageEvent: { type: 'text_delta', delta: 'Hello' },
     }); // stream 5
     await tick(300);
-    handlers['message_end']?.({ type: 'message_end', message: assistantMessage });
+    handlers['message_end']?.({
+      type: 'message_end',
+      message: Object.assign(assistantMessage, { durationMs: 1000 }),
+    });
     handlers['turn_end']?.(
       { type: 'turn_end', turnIndex: 0, message: assistantMessage, toolResults: [] },
       fixture.mockCtx
@@ -118,7 +121,9 @@ describe('pi-tps extension — telemetry flow', () => {
     expect(data.timing.totalMs).toBeGreaterThan(0);
     expect(data.timing.generationMs).toBeGreaterThan(0);
     expect(data.timing.messageCount).toBe(1);
-    expect(data.tps).toBeGreaterThan(0);
+    expect(data.timing.requestMs).toBe(1000);
+    expect(data.tps).toBe(200);
+    expect(notification).toContain('req 1.0s');
     expect(data.timestamp).toBeTypeOf('number');
 
     // Verify event was emitted with the same telemetry
@@ -372,7 +377,7 @@ describe('pi-tps extension — telemetry flow', () => {
 
   // ── True generation TPS (excluding TTFT and tool gaps) ──────────────────
 
-  it('should calculate true generation TPS excluding TTFT and tool gaps', async () => {
+  it('should sum model request durations across a tool gap', async () => {
     const { handlers, notifySpy } = fixture;
 
     const firstMessage: AssistantMessage = {
@@ -418,7 +423,7 @@ describe('pi-tps extension — telemetry flow', () => {
     };
 
     handlers['turn_start']?.({ type: 'turn_start', turnIndex: 0, timestamp: Date.now() });
-    await tick(100); // TTFT (excluded from generation TPS)
+    await tick(100); // turn preparation
 
     handlers['message_start']?.({ type: 'message_start', message: firstMessage });
     await tick(50);
@@ -430,9 +435,12 @@ describe('pi-tps extension — telemetry flow', () => {
     await tick(50);
     handlers['message_update']?.(updateEvent); // streaming
     await tick(50);
-    handlers['message_end']?.({ type: 'message_end', message: firstMessage });
+    handlers['message_end']?.({
+      type: 'message_end',
+      message: Object.assign(firstMessage, { durationMs: 250 }),
+    });
 
-    // TOOL EXECUTION GAP: 1000ms (excluded from generation TPS)
+    // Simulate time between the two model requests.
     await tick(1000);
 
     handlers['message_start']?.({ type: 'message_start', message: secondMessage });
@@ -461,7 +469,10 @@ describe('pi-tps extension — telemetry flow', () => {
       assistantMessageEvent: { type: 'text_delta', delta: 't' },
     }); // streaming
     await tick(100);
-    handlers['message_end']?.({ type: 'message_end', message: secondMessage });
+    handlers['message_end']?.({
+      type: 'message_end',
+      message: Object.assign(secondMessage, { durationMs: 550 }),
+    });
 
     handlers['turn_end']?.(
       { type: 'turn_end', turnIndex: 0, message: secondMessage, toolResults: [] },
@@ -471,21 +482,15 @@ describe('pi-tps extension — telemetry flow', () => {
     expect(notifySpy).toHaveBeenCalledOnce();
     const notification = notifySpy.mock.calls[0][0] as string;
 
-    const tpsMatch = notification.match(/TPS (\d+(?:\.\d+)?) tok\/s/);
-    expect(tpsMatch).toBeTruthy();
-    const tps = parseFloat(tpsMatch![1]);
-    // Inter-update TPS: 3+3=6 streaming updates across two messages.
-    // Span includes tool gap but still well under 100K (burst artifact).
-    expect(tps).toBeGreaterThan(50);
-    expect(tps).toBeLessThan(2000);
-
+    expect(notification).toContain('TPS 1250.0 tok/s');
+    expect(notification).toContain('req 0.8s');
     expect(notification).toContain('out 1K');
     expect(notification).toContain('in 600');
   });
 
-  // ── Inter-update TPS ──────────────────────────────────────────────────
+  // ── Request timing ──────────────────────────────────────────────────
 
-  it('should produce null TPS for burst delivery (all updates in same tick)', async () => {
+  it('should show no rate when a burst has no native duration', async () => {
     // Simulates the read-command case: all message_updates fire within
     // a single event loop tick, so the inter-update span is 0ms.
     const { handlers, notifySpy, appendEntrySpy } = fixture;
@@ -530,7 +535,6 @@ describe('pi-tps extension — telemetry flow', () => {
 
     expect(notifySpy).toHaveBeenCalledOnce();
     const notification = notifySpy.mock.calls[0][0] as string;
-    // No TPS number displayed — burst delivery can't produce meaningful rate
     expect(notification).toContain('TPS —');
 
     const [, data] = appendEntrySpy.mock.calls[0];
@@ -541,7 +545,7 @@ describe('pi-tps extension — telemetry flow', () => {
     expect(notification).toContain('out 46');
   });
 
-  it('should produce null TPS with only TTFT update and no streaming updates', async () => {
+  it('should report request TPS when the provider sends no updates', async () => {
     const { handlers, notifySpy, appendEntrySpy } = fixture;
 
     const assistantMessage = makeAssistantMessage({ output: 20, input: 10 });
@@ -550,14 +554,10 @@ describe('pi-tps extension — telemetry flow', () => {
     await tick(50);
     handlers['message_start']?.({ type: 'message_start', message: assistantMessage });
     await tick(50);
-    // Only TTFT update — no subsequent streaming updates
-    handlers['message_update']?.({
-      type: 'message_update',
-      message: assistantMessage,
-      assistantMessageEvent: { type: 'text_delta', delta: 'H' },
+    handlers['message_end']?.({
+      type: 'message_end',
+      message: Object.assign(assistantMessage, { durationMs: 1000 }),
     });
-    await tick(50);
-    handlers['message_end']?.({ type: 'message_end', message: assistantMessage });
     handlers['turn_end']?.(
       { type: 'turn_end', turnIndex: 0, message: assistantMessage, toolResults: [] },
       fixture.mockCtx
@@ -565,14 +565,15 @@ describe('pi-tps extension — telemetry flow', () => {
 
     expect(notifySpy).toHaveBeenCalledOnce();
     const notification = notifySpy.mock.calls[0][0] as string;
-    expect(notification).toContain('TPS —');
+    expect(notification).toContain('TPS 20.0 tok/s');
 
     const [, data] = appendEntrySpy.mock.calls[0];
-    expect(data.tps).toBeNull();
-    expect(data.timing.streamMs).toBeNull(); // no streaming updates at all
+    expect(data.tps).toBe(20);
+    expect(data.timing.ttftMs).toBeNull();
+    expect(data.timing.streamMs).toBeNull();
   });
 
-  it('should calculate inter-update TPS from streaming updates', async () => {
+  it('should record the stream span alongside request TPS', async () => {
     const { handlers, notifySpy, appendEntrySpy } = fixture;
 
     const assistantMessage: AssistantMessage = {
@@ -615,7 +616,10 @@ describe('pi-tps extension — telemetry flow', () => {
     await tick(100);
     handlers['message_update']?.(updateEvent); // streaming #5
     await tick(100);
-    handlers['message_end']?.({ type: 'message_end', message: assistantMessage });
+    handlers['message_end']?.({
+      type: 'message_end',
+      message: Object.assign(assistantMessage, { durationMs: 1000 }),
+    });
     handlers['turn_end']?.(
       { type: 'turn_end', turnIndex: 0, message: assistantMessage, toolResults: [] },
       fixture.mockCtx
@@ -623,16 +627,10 @@ describe('pi-tps extension — telemetry flow', () => {
 
     expect(notifySpy).toHaveBeenCalledOnce();
     const notification = notifySpy.mock.calls[0][0] as string;
-    const tpsMatch = notification.match(/TPS (\d+(?:\.\d+)?) tok\/s/);
-    expect(tpsMatch).toBeTruthy();
-    const tps = parseFloat(tpsMatch![1]);
-    // Inter-update span ~500ms (5 gaps of ~100ms between streaming updates)
-    // 500 tokens / 0.5s ≈ 1000 TPS (real timer is approximate, so just check sane range)
-    expect(tps).toBeGreaterThan(400);
-    expect(tps).toBeLessThan(5000); // no 452K burst artifact
+    expect(notification).toContain('TPS 500.0 tok/s');
 
     const [, data] = appendEntrySpy.mock.calls[0];
-    expect(data.tps).toBeGreaterThan(0);
+    expect(data.tps).toBe(500);
     expect(data.timing.streamMs).toBeGreaterThan(0);
   });
 

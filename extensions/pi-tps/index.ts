@@ -2,8 +2,8 @@
  * pi-tps — Tokens-per-second tracker for pi
  *
  * Captures structured telemetry at every LLM turn (per-API-call).
- * Tracks real-time TPS via token-by-token updates, detects inference
- * stalls (GPU queuing / request queuing pauses), and persists telemetry
+ * Uses the Pi response duration to measure request TPS, records gaps in
+ * stream delivery, and persists telemetry
  * as custom entries in the session JSONL for provider debugging.
  *
  * Originally from: https://github.com/badlogic/pi-mono/blob/main/.pi/extensions/tps.ts
@@ -60,13 +60,6 @@ interface SessionTreeEvent {
   oldLeafId: string | null;
 }
 
-interface ToolExecutionStartEvent {
-  type: 'tool_execution_start';
-  toolCallId: string;
-  toolName: string;
-  args: unknown;
-}
-
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 /** Minimum gap between token updates to count as a stall (ms) */
@@ -82,16 +75,17 @@ interface TurnTelemetry {
   model: { provider: string; modelId: string };
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   timing: {
-    ttftMs: number | null; // time to first token
+    ttftMs: number | null; // time from turn_start to the first assistant update
     totalMs: number; // wall clock: turn_start → turn_end
-    generationMs: number; // wall clock streaming time (message_start → message_end per message)
-    streamMs: number | null; // inter-update span: first streaming update → last streaming update
-    stallMs: number; // accumulated gaps > STALL_THRESHOLD_MS
+    generationMs: number; // span from message_start to message_end per message
+    requestMs?: number | null; // Pi's durationMs summed for output-bearing messages
+    streamMs: number | null; // span from the second to the last assistant update
+    stallMs: number; // accumulated gaps >= STALL_THRESHOLD_MS
     stallCount: number; // how many discrete stall events
     messageCount: number; // assistant messages in this turn
   };
-  tps: number | null; // output / (streamMs / 1000), null when burst/degenerate
-  isPrimaryBranch: boolean; // TPS came from primary-branch (reliable) measurement
+  tps: number | null; // output / (requestMs / 1000)
+  isPrimaryBranch: boolean; // compatibility field; true for a native-duration measurement
   cost: {
     input: number;
     output: number;
@@ -122,15 +116,12 @@ interface TurnTiming {
   totalGenerationMs: number;
   // Inter-update TPS tracking: measures the streaming span between
   // the first and last non-TTFT message_update events.
-  updateCount: number; // number of message_update events after the first (TTFT) one
   firstStreamUpdateMs: number | null; // timestamp of first non-TTFT update
   lastStreamUpdateMs: number; // timestamp of most recent non-TTFT update
   stallMs: number;
   stallCount: number;
   inStall: boolean;
   messageCount: number;
-  isToolCall: boolean; // tool_execution_start fired during this turn
-  isPrimaryBranch: boolean; // TPS came from primary-branch (reliable) measurement
   turnStartTimestamp: number; // wall-clock ms at turn_start, for correlating session energy entries
 }
 
@@ -291,6 +282,9 @@ function composeDisplayString(t: TurnTelemetry): string {
   if (t.timing.ttftMs !== null) {
     parts.push(`TTFT ${formatDuration(t.timing.ttftMs / 1000)}`);
   }
+  if (t.timing.requestMs != null) {
+    parts.push(`req ${formatDuration(t.timing.requestMs / 1000)}`);
+  }
   parts.push(formatDuration(t.timing.totalMs / 1000));
   parts.push(`in ${formatNumber(t.tokens.input)}`);
   parts.push(`out ${formatNumber(t.tokens.output)}`);
@@ -315,6 +309,7 @@ function buildTelemetry(
 ): TurnTelemetry | null {
   let input = 0;
   let output = 0;
+  let requestMs: number | null = 0;
   let cacheRead = 0;
   let cacheWrite = 0;
   let totalTokens = 0;
@@ -328,7 +323,15 @@ function buildTelemetry(
 
   for (const message of timing.assistantMessages) {
     input += message.usage.input || 0;
-    output += message.usage.output || 0;
+    const messageOutput = message.usage.output || 0;
+    output += messageOutput;
+    if (messageOutput > 0 && requestMs !== null) {
+      const durationMs = 'durationMs' in message ? message.durationMs : undefined;
+      requestMs =
+        typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs > 0
+          ? requestMs + durationMs
+          : null;
+    }
     cacheRead += message.usage.cacheRead || 0;
     cacheWrite += message.usage.cacheWrite || 0;
     totalTokens += message.usage.totalTokens || 0;
@@ -346,143 +349,15 @@ function buildTelemetry(
   }
 
   if (output <= 0) return null;
-  if (!timing.firstTokenMs) return null;
   if (!model) return null;
 
   const totalMs = turnEndMs - timing.turnStartMs;
 
-  // Inter-update TPS: measures the streaming span between the first and
-  // last non-TTFT message_update events.
-  //
-  // Three-branch gate:
-  //   Primary:   ≥5 updates, avg inter-chunk gap ≥1ms → streamMs is genuine
-  //              generation timing, not buffer-flush dispatch overhead.
-  //   Fallback:  ≥2 updates, totalGenerationMs ≥50ms → conservative rate
-  //              using the full generation window (includes TTFT, so it
-  //              underestimates — by design, to avoid overshooting).
-  //   Else:      null — structurally unidentifiable.
-  //
-  // The avg inter-chunk gap is the key signal: buffer flushes dispatch
-  // chunks with ~0.3–0.5ms gaps (network overhead only), while genuine
-  // streaming at 3000 TPS with 5-token chunks has ~1.7ms gaps. A 1ms
-  // threshold cleanly separates the two regimes without capping TPS by
-  // magnitude — a legitimate 5000 TPS provider with 10-token chunks
-  // still passes (2ms gaps), and future faster hardware with larger
-  // batches passes too.
-  const MIN_STREAM_MS = 1;
-  const MIN_STREAM_UPDATES = 5;
-  const MIN_INTER_CHUNK_MS = 1;
-  const MIN_GENERATION_MS = 200;
-  const ACTIVE_TIME_THRESHOLD_MS = 200;
-  const STALL_REDUCTION_DENOM = 2;
-  const STALL_DOMINANCE_RATIO = 0.85;
-
-  // Maximum plausible generation speed (tokens/second). Beyond this, the
-  // measured TPS is almost certainly a measurement artifact — the effective
-  // generation window is too short relative to the token volume to
-  // distinguish genuine inference from a buffer-flush dispatch of
-  // pre-generated tokens. At 10_000 TPS this is 5× the fastest known
-  // commercial inference (Cerebras ~2_000 tok/s). The gate is phrased as
-  // "extraordinary claims require extraordinary evidence": for X output
-  // tokens, the minimum reliable measurement window is X / MAX_PLAUSIBLE_TPS
-  // seconds. Below that, the volume of tokens cannot be reliably timed, and
-  // TPS is set to null. This is mathematically equivalent to nulling out
-  // TPS when computed TPS > MAX_PLAUSIBLE_TPS.
-  const MAX_PLAUSIBLE_TPS = 10_000;
-
   const streamMs =
-    timing.updateCount > 0 && timing.firstStreamUpdateMs !== null
+    timing.firstStreamUpdateMs !== null
       ? timing.lastStreamUpdateMs - timing.firstStreamUpdateMs
       : null;
-
-  const avgInterChunkGap =
-    streamMs !== null && timing.updateCount > 1 ? streamMs / (timing.updateCount - 1) : 0;
-
-  // ── Generation TPS ────────────────────────────────────────────────────
-  // Raw inference speed: output / (active streaming time / 1000).
-  // Excludes BOTH TTFT and known stalls — this is the speed at which the
-  // model was actually producing tokens during active generation.
-  //
-  // The stall-before-stream bug: when a stall occurs between TTFT and the
-  // first stream update, firstStreamUpdateMs is set AFTER the stall, making
-  // streamMs only cover the post-stall burst. Subtracting stallMs from
-  // streamMs gives the "active generation" span, but when stallMs ≥ streamMs
-  // the result is unreliable — the post-stall cluster could be a buffer-flush
-  // dispatch of pre-generated tokens, not sustained inference.
-  //
-  // Three guard conditions prevent inflation:
-  //  1. stallMs < streamMs: prevents stall-before-stream where
-  //     firstStreamUpdateMs lands AFTER the stall.
-  //  2. effectiveStreamMs >= 50ms: the active span must be long enough to
-  //     distinguish genuine generation from a dispatch artifact.
-  //  3. stallMs < effectiveStreamMs: when stalls exceed active generation
-  //     time (e.g. 998ms stall, 53ms active), the "active" span is likely
-  //     a buffer-flush burst of pre-generated tokens, not sustained
-  //     inference. Requiring stall time < active time ensures the
-  //     streaming window is dominated by generation, not stalls.
-  //
-  // Three-branch gate:
-  //   Primary:   all 3 guards pass → output / (effectiveStreamMs / 1000)
-  //   Fallback:  ≥2 updates, generationMs ≥50ms
-  //              → output / (effectiveGenMs / 1000)
-  //              Includes TTFT, underestimates, but never overshoots.
-  //   Else:      null — structurally unidentifiable.
-  let tps: number | null = null;
-  let isPrimaryBranch = false;
-  if (
-    streamMs !== null &&
-    streamMs >= MIN_STREAM_MS &&
-    timing.updateCount >= MIN_STREAM_UPDATES &&
-    avgInterChunkGap >= MIN_INTER_CHUNK_MS &&
-    timing.stallMs < streamMs && // stalls must not dominate streaming span
-    streamMs - timing.stallMs >= MIN_GENERATION_MS && // effective span must be measurable
-    timing.stallMs < streamMs - timing.stallMs // stall time < active time
-  ) {
-    // Active generation time: streaming window minus known stalls.
-    // streamMs already excludes TTFT; subtracting stallMs gives the
-    // time the model was actually generating tokens.
-    const effectiveStreamMs = streamMs - timing.stallMs;
-    const raw = output / (effectiveStreamMs / 1000);
-    tps = Math.round(raw * 10) / 10;
-    isPrimaryBranch = true;
-  } else if (timing.updateCount >= 2 && timing.totalGenerationMs >= MIN_GENERATION_MS) {
-    // Fallback: use generationMs (message_start → message_end) minus
-    // stalls. This includes TTFT, so it underestimates generation speed,
-    // but it's safe — no inflation possible.
-    let effectiveGenMs = timing.totalGenerationMs - timing.stallMs;
-    const stallsDominate =
-      effectiveGenMs < ACTIVE_TIME_THRESHOLD_MS ||
-      timing.stallMs > timing.totalGenerationMs * STALL_DOMINANCE_RATIO;
-    if (stallsDominate) {
-      effectiveGenMs = Math.max(
-        timing.totalGenerationMs - timing.stallMs / STALL_REDUCTION_DENOM,
-        MIN_GENERATION_MS
-      );
-    } else {
-      effectiveGenMs = Math.max(effectiveGenMs, MIN_GENERATION_MS);
-    }
-    const raw = output / (effectiveGenMs / 1000);
-    tps = Math.round(raw * 10) / 10;
-  } else {
-    tps = null;
-  }
-
-  // Volume-based sanity gate: extraordinary TPS claims require
-  // proportionally longer measurement windows. When a provider emits a
-  // large volume of tokens in a short time window, the measured rate is
-  // dominated by dispatch/buffer-flush timing rather than actual inference
-  // speed. For X output tokens, the minimum reliable generation window is
-  // X / MAX_PLAUSIBLE_TPS seconds — below that, the volume of tokens cannot
-  // be reliably timed, and TPS is set to null.
-  //
-  // Mathematically equivalent to: computed TPS > MAX_PLAUSIBLE_TPS → null.
-  // But phrased as a measurement-reliability principle: the evidence
-  // (effective window duration) must be proportional to the claim (token
-  // volume ÷ inferred rate).
-  if (tps !== null && tps > MAX_PLAUSIBLE_TPS) {
-    tps = null;
-    isPrimaryBranch = false;
-  }
+  const tps = requestMs === null ? null : Math.round((output / (requestMs / 1000)) * 10) / 10;
 
   // Single blended $/M-tokens rate for the banner. Cost source: Neuralwatt's
   // billed cost when present (energy-based, what the user actually pays),
@@ -499,16 +374,17 @@ function buildTelemetry(
     model,
     tokens: { input, output, cacheRead, cacheWrite, total: totalTokens },
     timing: {
-      ttftMs: timing.firstTokenMs - timing.turnStartMs,
+      ttftMs: timing.firstTokenMs === null ? null : timing.firstTokenMs - timing.turnStartMs,
       totalMs,
       generationMs: timing.totalGenerationMs,
+      requestMs,
       streamMs,
       stallMs: timing.stallMs,
       stallCount: timing.stallCount,
       messageCount: timing.messageCount,
     },
     tps,
-    isPrimaryBranch,
+    isPrimaryBranch: tps !== null,
     cost:
       listPriceCost !== null
         ? {
@@ -529,10 +405,6 @@ function buildTelemetry(
 export default function tpsExtension(pi: ExtensionAPI) {
   // Current turn timing state
   let currentTiming: TurnTiming | null = null;
-
-  // Per-model TPS cap: highest reliable (primary-branch, non-tool-call) TPS observed.
-  // Tool-call turns get clamped to this value. Only set by reliable streaming measurements.
-  const tpsCaps = new Map<string, number>(); // "provider:modelId" → cap
 
   // Cached session entries for argument completion (captured on session_start / session_tree)
   let cachedEntries: Array<{ type?: string; customType?: string; data?: unknown }> = [];
@@ -652,7 +524,7 @@ export default function tpsExtension(pi: ExtensionAPI) {
 
   // ── Turn timing ─────────────────────────────────────────────────────────
 
-  // Track when a turn starts (request sent to LLM)
+  // Track wall-clock latency from the beginning of the Pi turn.
   pi.on('turn_start', (_event: TurnStartEvent) => {
     pendingNeuralwattBilledCost = null;
     lastCommittedTurn = null;
@@ -665,28 +537,24 @@ export default function tpsExtension(pi: ExtensionAPI) {
       currentMessageStartMs: null,
       assistantMessages: [],
       totalGenerationMs: 0,
-      updateCount: 0,
       firstStreamUpdateMs: null,
       lastStreamUpdateMs: 0,
       stallMs: 0,
       stallCount: 0,
       inStall: false,
       messageCount: 0,
-      isToolCall: false,
-      isPrimaryBranch: false,
     };
   });
 
-  // Track when a message starts. In pi, message_start fires at stream
-  // creation (before any tokens), so we defer TTFT to the first
-  // message_update which carries the first real token.
+  // The assistant message starts when the provider emits its stream start.
+  // Providers can emit that after the underlying request has begun.
   pi.on('message_start', (event: MessageStartEvent) => {
     if (!currentTiming) return;
     if (!isAssistantMessage(event.message)) return;
 
     const now = performance.now();
 
-    // Track when THIS message started streaming (for generation TPS)
+    // Capture the message event span for diagnostics.
     currentTiming.currentMessageStartMs = now;
     currentTiming.messageCount++;
 
@@ -696,26 +564,21 @@ export default function tpsExtension(pi: ExtensionAPI) {
     currentTiming.inStall = false;
   });
 
-  // Track token-by-token updates during streaming (real-time TPS & stall detection).
-  // The first message_update is the effective first token (message_start fires
-  // at stream creation, before any content arrives).
+  // Track the time to the first assistant update and gaps in delivery.
   pi.on('message_update', (event: MessageUpdateEvent) => {
     if (!currentTiming) return;
     if (!isAssistantMessage(event.message)) return;
 
     const now = performance.now();
 
-    // First token: capture TTFT and seed stall timing, then bail.
-    // No stall detection on this event — the gap from message_start to
-    // first message_update is provider parsing overhead, not a stall.
+    // The initial wait is recorded separately from inter-update gaps.
     if (currentTiming.firstTokenMs === null) {
       currentTiming.firstTokenMs = now;
       currentTiming.lastUpdateMs = now;
       return;
     }
 
-    // Track inter-update streaming span for TPS calculation
-    currentTiming.updateCount++;
+    // Track the span of updates after the first for diagnostics.
     if (currentTiming.firstStreamUpdateMs === null) {
       currentTiming.firstStreamUpdateMs = now;
     }
@@ -738,13 +601,6 @@ export default function tpsExtension(pi: ExtensionAPI) {
     currentTiming.lastUpdateMs = now;
   });
 
-  // Track when a tool starts executing — marks this turn as a tool call
-  // for the dynamic TPS cap (tool-call turns only get capped, never set the cap).
-  pi.on('tool_execution_start', (_event: ToolExecutionStartEvent) => {
-    if (!currentTiming) return;
-    currentTiming.isToolCall = true;
-  });
-
   // Track when a message ends
   pi.on('message_end', (event: MessageEndEvent) => {
     if (!currentTiming) return;
@@ -752,8 +608,8 @@ export default function tpsExtension(pi: ExtensionAPI) {
 
     const now = performance.now();
 
-    // Accumulate ACTUAL streaming time for this message (true generation time)
-    if (currentTiming.currentMessageStartMs) {
+    // Record the duration between the message start and end events.
+    if (currentTiming.currentMessageStartMs !== null) {
       const messageGenerationMs = now - currentTiming.currentMessageStartMs;
       currentTiming.totalGenerationMs += messageGenerationMs;
       currentTiming.currentMessageStartMs = null;
@@ -796,28 +652,6 @@ export default function tpsExtension(pi: ExtensionAPI) {
 
     const telemetry = buildTelemetry(timing, turnEndMs, billedCost);
     if (!telemetry) return;
-
-    // ── Dynamic TPS cap ────────────────────────────────────────────────
-    // Only non-tool-call, primary-branch (reliable) measurements set the cap.
-    // Tool-call turns get clamped to the cap to prevent inflation from
-    // short outputs over tiny time windows.
-    const modelKey = `${telemetry.model.provider}:${telemetry.model.modelId}`;
-
-    if (telemetry.isPrimaryBranch && telemetry.tps !== null) {
-      const currentCap = tpsCaps.get(modelKey);
-      if (currentCap === undefined || telemetry.tps > currentCap) {
-        tpsCaps.set(modelKey, telemetry.tps);
-      }
-    }
-
-    if (timing.isToolCall && telemetry.tps !== null) {
-      const cap = tpsCaps.get(modelKey);
-      if (cap !== undefined) {
-        telemetry.tps = Math.min(telemetry.tps, cap);
-      } else {
-        telemetry.tps = null;
-      }
-    }
 
     // Record this turn so a late-arriving neuralwatt:turn-energy event
     // (provider loaded after us) can retroactively correct the rate. Billed

@@ -137,9 +137,7 @@ describe('pi-tps extension — stall detection', () => {
   });
 
   it('should not produce inflated TPS when stall occurs before first stream update', async () => {
-    // This is the bug scenario: a large gap after TTFT causes the stall
-    // detector to fire on the first streaming update, but that means
-    // firstStreamUpdateMs is set AFTER the stall, making streamMs tiny.
+    // Simulate a long delay between the first two updates.
     const { handlers, notifySpy, appendEntrySpy } = fixture;
 
     const assistantMessage: AssistantMessage = {
@@ -187,7 +185,10 @@ describe('pi-tps extension — stall detection', () => {
     handlers['message_update']?.(updateEvent);
 
     await tick(50);
-    handlers['message_end']?.({ type: 'message_end', message: assistantMessage });
+    handlers['message_end']?.({
+      type: 'message_end',
+      message: Object.assign(assistantMessage, { durationMs: 3500 }),
+    });
     handlers['turn_end']?.(
       { type: 'turn_end', turnIndex: 0, message: assistantMessage, toolResults: [] },
       fixture.mockCtx
@@ -200,10 +201,7 @@ describe('pi-tps extension — stall detection', () => {
     expect(data.timing.stallMs).toBeGreaterThanOrEqual(2000);
     expect(data.timing.stallCount).toBeGreaterThanOrEqual(1);
 
-    // TPS must be sane (not in the thousands)
-    // With stall guard: stallMs >= streamMs → fallback branch
-    // Fallback: effectiveGenMs = generationMs - stallMs
-    expect(data.tps).not.toBeNull();
-    expect(data.tps!).toBeLessThan(500); // sane, not thousands
+    expect(data.timing.requestMs).toBe(3500);
+    expect(data.tps).toBe(28.6);
   });
 });
